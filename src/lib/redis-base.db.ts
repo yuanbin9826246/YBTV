@@ -11,8 +11,9 @@ import {
   MusicV2PlaylistRecord,
 } from './music-v2';
 import { RedisAdapter } from './redis-adapter';
-import { Favorite, IStorage, PlayRecord, SkipConfig } from './types';
+import { Favorite, IStorage, Notification, PlayRecord, PushSubscriptionRecord, SkipConfig } from './types';
 import { userInfoCache } from './user-cache';
+import { dispatchWebPushNotification } from './web-push';
 
 // 搜索历史最大条数
 const SEARCH_HISTORY_LIMIT = 20;
@@ -2268,6 +2269,8 @@ export abstract class BaseRedisStorage implements IStorage {
         JSON.stringify(notifications)
       )
     );
+
+    await dispatchWebPushNotification(this, userName, notification);
   }
 
   async markNotificationAsRead(
@@ -2463,6 +2466,106 @@ export abstract class BaseRedisStorage implements IStorage {
     );
     // 清除缓存
     userInfoCache?.delete(userName);
+  }
+
+
+  private pushSubscriptionsKey(userName: string): string {
+    return `u:${userName}:push_subscriptions`;
+  }
+
+  async upsertPushSubscription(
+    userName: string,
+    subscription: PushSubscriptionRecord
+  ): Promise<void> {
+    await this.withRetry(() =>
+      this.adapter.hSet(
+        this.pushSubscriptionsKey(userName),
+        subscription.id,
+        JSON.stringify({ ...subscription, username: userName, updatedAt: Date.now() })
+      )
+    );
+  }
+
+  async getEnabledPushSubscriptions(userName: string): Promise<PushSubscriptionRecord[]> {
+    const all = await this.withRetry(() =>
+      this.adapter.hGetAll(this.pushSubscriptionsKey(userName))
+    );
+    if (!all || typeof all !== 'object') return [];
+
+    return Object.values(all)
+      .map((raw) => {
+        try {
+          return JSON.parse(raw as string) as PushSubscriptionRecord;
+        } catch {
+          return null;
+        }
+      })
+      .filter((item): item is PushSubscriptionRecord => Boolean(item?.enabled));
+  }
+
+  async deletePushSubscriptionByEndpoint(userName: string, endpoint: string): Promise<void> {
+    const subscriptions = await this.getEnabledPushSubscriptions(userName);
+    const target = subscriptions.find((item) => item.endpoint === endpoint);
+    if (!target) return;
+    await this.withRetry(() =>
+      this.adapter.hDel(this.pushSubscriptionsKey(userName), target.id)
+    );
+  }
+
+  async deletePushSubscriptionsByTokenId(userName: string, tokenId: string): Promise<void> {
+    const all = await this.withRetry(() =>
+      this.adapter.hGetAll(this.pushSubscriptionsKey(userName))
+    );
+    if (!all || typeof all !== 'object') return;
+
+    for (const [id, raw] of Object.entries(all)) {
+      try {
+        const subscription = JSON.parse(raw as string) as PushSubscriptionRecord;
+        if (subscription.tokenId === tokenId) {
+          await this.withRetry(() =>
+            this.adapter.hDel(this.pushSubscriptionsKey(userName), id)
+          );
+        }
+      } catch {
+        // ignore malformed record
+      }
+    }
+  }
+
+  async deleteAllPushSubscriptions(userName: string): Promise<void> {
+    await this.withRetry(() => this.adapter.del(this.pushSubscriptionsKey(userName)));
+  }
+
+  async updatePushSubscriptionDeliveryStats(
+    userName: string,
+    endpoint: string,
+    success: boolean
+  ): Promise<void> {
+    const all = await this.withRetry(() =>
+      this.adapter.hGetAll(this.pushSubscriptionsKey(userName))
+    );
+    if (!all || typeof all !== 'object') return;
+
+    for (const [id, raw] of Object.entries(all)) {
+      try {
+        const subscription = JSON.parse(raw as string) as PushSubscriptionRecord;
+        if (subscription.endpoint !== endpoint) continue;
+        const now = Date.now();
+        const next = {
+          ...subscription,
+          updatedAt: now,
+          lastSuccessAt: success ? now : subscription.lastSuccessAt || null,
+          lastFailureAt: success ? subscription.lastFailureAt || null : now,
+          failureCount: success ? 0 : (subscription.failureCount || 0) + 1,
+        };
+        await this.withRetry(() =>
+          this.adapter.hSet(this.pushSubscriptionsKey(userName), id, JSON.stringify(next))
+        );
+        return;
+      } catch {
+        // ignore malformed record
+      }
+    }
   }
 
   // ---------- TVBox订阅token相关 ----------

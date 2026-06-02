@@ -448,6 +448,8 @@ dockge/komodo 等 docker compose UI 也有自动更新功能
 | DANMAKU_API_TOKEN                        | 弹幕 API Token                                               | 任意字符串                  | 87654321                                                     |
 | DATA_MIGRATION_CHUNK_SIZE                | 数据迁移批处理大小（控制导入导出时每批处理的用户数量和数据条数） | 正整数                      | 10                                                           |
 | QR_LOGIN_STORE_MODE                      | 电视端扫码登录状态存储模式；serverless环境下多节点内存状态不可靠。 | auto、memory、hybrid、shared | auto                                                         |
+| WEB_PUSH_PROXY                           | Web Push 服务端发送代理地址，用于服务器访问 FCM 等 Push endpoint | HTTP/HTTPS 代理 URL          | (空)                                                         |
+| WEB_PUSH_BASEURL                         | Web Push endpoint 反向代理 Base URL；支持 `{endpoint}`（URL编码）和 `{raw_endpoint}`（不编码）占位符 | URL                         | (空)                                                         |
 
 NEXT_PUBLIC_DOUBAN_PROXY_TYPE 选项解释：
 

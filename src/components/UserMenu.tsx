@@ -213,9 +213,13 @@ export const UserMenu: React.FC = () => {
   );
   const [filesystemSavePath, setFilesystemSavePath] = useState<string>('');
 
-  // 邮件通知设置
+  // 通知设置
   const [userEmail, setUserEmail] = useState('');
   const [emailNotifications, setEmailNotifications] = useState(false);
+  const [pushNotifications, setPushNotifications] = useState(false);
+  const [pushNotificationsConfigured, setPushNotificationsConfigured] = useState(false);
+  const [pushNotificationsSupported, setPushNotificationsSupported] = useState(false);
+  const [pushNotificationsBusy, setPushNotificationsBusy] = useState(false);
   const [emailSettingsLoading, setEmailSettingsLoading] = useState(false);
   const [emailSettingsSaving, setEmailSettingsSaving] = useState(false);
   const [emailSettingsMessage, setEmailSettingsMessage] = useState('');
@@ -838,7 +842,7 @@ export const UserMenu: React.FC = () => {
     }
   }, []);
 
-  // 加载邮件通知设置
+  // 加载通知设置
   const loadEmailSettings = async () => {
     setEmailSettingsLoading(true);
     setEmailSettingsMessage('');
@@ -850,14 +854,207 @@ export const UserMenu: React.FC = () => {
         setUserEmail(data.email || '');
         setEmailNotifications(data.emailNotifications || false);
       }
+
+      const pushResponse = await fetch('/api/notifications/push');
+      if (pushResponse.ok) {
+        const pushData = await pushResponse.json();
+        setPushNotificationsConfigured(Boolean(pushData.configured && pushData.publicKey));
+        setPushNotificationsSupported(
+          Boolean(
+            pushData.configured &&
+            pushData.publicKey &&
+            pushData.hasDeviceToken &&
+            typeof window !== 'undefined' &&
+            'Notification' in window &&
+            'serviceWorker' in navigator &&
+            'PushManager' in window
+          )
+        );
+        setPushNotifications(Boolean(pushData.pushNotifications));
+      }
     } catch (error) {
-      console.error('加载邮件设置失败:', error);
+      console.error('加载通知设置失败:', error);
     } finally {
       setEmailSettingsLoading(false);
     }
   };
 
-  // 保存邮件通知设置
+  const urlBase64ToUint8Array = (base64String: string) => {
+    const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+    const base64 = (base64String + padding)
+      .replace(/-/g, '+')
+      .replace(/_/g, '/');
+    const rawData = window.atob(base64);
+    const outputArray = new Uint8Array(rawData.length);
+    for (let i = 0; i < rawData.length; i++) {
+      outputArray[i] = rawData.charCodeAt(i);
+    }
+    return outputArray;
+  };
+
+  const arrayBufferToBase64Url = (buffer: ArrayBuffer | null) => {
+    if (!buffer) return '';
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return window
+      .btoa(binary)
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/g, '');
+  };
+
+  const isSubscriptionUsingPublicKey = (
+    subscription: PushSubscription,
+    publicKey: string
+  ) => {
+    const subscriptionKey = arrayBufferToBase64Url(
+      subscription.options?.applicationServerKey || null
+    );
+    return subscriptionKey === publicKey;
+  };
+
+  const waitForServiceWorkerActivation = async (
+    registration: ServiceWorkerRegistration
+  ) => {
+    let pendingWorker = registration.installing || registration.waiting;
+
+    if (!pendingWorker) {
+      await registration.update();
+      pendingWorker = registration.installing || registration.waiting;
+    }
+
+    // 没有新的 installing/waiting worker 时，说明当前 active registration 可直接使用。
+    if (!pendingWorker) {
+      if (registration.active) return registration;
+      throw new Error('Service Worker 注册失败，请刷新页面后重试');
+    }
+
+    const activatingWorker = pendingWorker;
+    if (activatingWorker.state === 'activated') return registration;
+
+    await new Promise<void>((resolve, reject) => {
+      const handleStateChange = () => {
+        if (activatingWorker.state === 'activated') {
+          activatingWorker.removeEventListener('statechange', handleStateChange);
+          resolve();
+        } else if (activatingWorker.state === 'redundant') {
+          activatingWorker.removeEventListener('statechange', handleStateChange);
+          reject(new Error('Service Worker 激活失败，请刷新页面后重试'));
+        }
+      };
+
+      activatingWorker.addEventListener('statechange', handleStateChange);
+      handleStateChange();
+    });
+
+    return registration;
+  };
+
+  const getReadyServiceWorkerRegistration = async () => {
+    if (!('serviceWorker' in navigator)) {
+      throw new Error('当前浏览器不支持 Service Worker');
+    }
+
+    // 开启系统通知时明确使用带 push 事件处理器的 Service Worker。
+    // 如果浏览器里已有旧 /sw.js 注册，重新注册同一 scope 的 /push-sw.js 会更新该注册；
+    // push-sw.js 内部会 skipWaiting + clients.claim，激活后再订阅，确保 Push 到达能展示通知。
+    const registration = await navigator.serviceWorker.register('/push-sw.js', {
+      scope: '/',
+      updateViaCache: 'none',
+    });
+
+    return waitForServiceWorkerActivation(registration);
+  };
+
+  const handlePushNotificationsChange = async (enabled: boolean) => {
+    if (!enabled) {
+      setPushNotificationsBusy(true);
+      try {
+        let endpoint: string | undefined;
+        const registration =
+          'serviceWorker' in navigator
+            ? await navigator.serviceWorker.getRegistration()
+            : undefined;
+        const subscription = await registration?.pushManager.getSubscription();
+        endpoint = subscription?.endpoint;
+        await subscription?.unsubscribe();
+        await fetch('/api/notifications/push', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ endpoint }),
+        });
+        setPushNotifications(false);
+      } catch (error) {
+        console.error('关闭浏览器通知失败:', error);
+        setEmailSettingsMessage('关闭浏览器通知失败，请重试');
+        setEmailSettingsMessageType('error');
+      } finally {
+        setPushNotificationsBusy(false);
+      }
+      return;
+    }
+
+    setPushNotificationsBusy(true);
+    setEmailSettingsMessage('');
+    setEmailSettingsMessageType(null);
+    try {
+      const statusResponse = await fetch('/api/notifications/push');
+      const status = statusResponse.ok ? await statusResponse.json() : null;
+      if (!status?.configured || !status?.publicKey) {
+        throw new Error('管理员尚未配置 Web Push VAPID 密钥');
+      }
+
+      const permission = await Notification.requestPermission();
+      if (permission !== 'granted') {
+        throw new Error('浏览器通知权限未授权');
+      }
+
+      const registration = await getReadyServiceWorkerRegistration();
+
+      let subscription = await registration.pushManager.getSubscription();
+      if (subscription && !isSubscriptionUsingPublicKey(subscription, status.publicKey)) {
+        await subscription.unsubscribe();
+        subscription = null;
+      }
+
+      if (!subscription) {
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(status.publicKey),
+        });
+      }
+
+      const response = await fetch('/api/notifications/push', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enabled: true,
+          subscription: subscription.toJSON(),
+        }),
+      });
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error || '保存浏览器通知订阅失败');
+      }
+
+      setPushNotifications(true);
+      setEmailSettingsMessage('浏览器系统通知已开启');
+      setEmailSettingsMessageType('success');
+    } catch (error) {
+      console.error('开启浏览器通知失败:', error);
+      setPushNotifications(false);
+      setEmailSettingsMessage(error instanceof Error ? error.message : '开启浏览器通知失败');
+      setEmailSettingsMessageType('error');
+    } finally {
+      setPushNotificationsBusy(false);
+    }
+  };
+
+  // 保存通知设置
   const handleSaveEmailSettings = async () => {
     setEmailSettingsSaving(true);
     setEmailSettingsMessage('');
@@ -885,7 +1082,7 @@ export const UserMenu: React.FC = () => {
         setEmailSettingsMessageType('error');
       }
     } catch (error) {
-      console.error('保存邮件设置失败:', error);
+      console.error('保存通知设置失败:', error);
       setEmailSettingsMessage('保存失败，请重试');
       setEmailSettingsMessageType('error');
     } finally {
@@ -4866,6 +5063,11 @@ export const UserMenu: React.FC = () => {
         onUserEmailChange={setUserEmail}
         emailNotifications={emailNotifications}
         onEmailNotificationsChange={setEmailNotifications}
+        pushNotifications={pushNotifications}
+        onPushNotificationsChange={handlePushNotificationsChange}
+        pushNotificationsSupported={pushNotificationsSupported}
+        pushNotificationsConfigured={pushNotificationsConfigured}
+        pushNotificationsBusy={pushNotificationsBusy}
         emailSettingsLoading={emailSettingsLoading}
         emailSettingsSaving={emailSettingsSaving}
         onSave={handleSaveEmailSettings}

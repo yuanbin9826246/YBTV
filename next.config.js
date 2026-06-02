@@ -183,6 +183,7 @@ const createNextConfig = (phase) => {
     dest: 'public',
     register: true,
     skipWaiting: true,
+    importScripts: ['/push-sw.js'],
   });
 
   return withPWA(nextConfig);
